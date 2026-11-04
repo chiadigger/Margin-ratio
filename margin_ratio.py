@@ -94,11 +94,29 @@ def tables_of(j):
     return out
 
 
+def _isnum(x):
+    return str(x).replace(",", "").strip().lstrip("-").replace(".", "", 1).isdigit()
+
+
+def describe(tag, j):
+    """印出回傳結構, 解析不到資料時用來診斷"""
+    try:
+        print(f"[診斷] {tag}: keys={list(j.keys())}")
+        for i, (f, rows, summ) in enumerate(tables_of(j)):
+            print(f"[診斷] {tag} table{i}: fields={f[:14]} 筆數={len(rows)} "
+                  f"第1筆={rows[0][:10] if rows else None} summary={summ[:3]}")
+        if not tables_of(j):
+            print(f"[診斷] {tag}: 內容前300字={str(j)[:300]}")
+    except Exception as e:
+        print(f"[診斷] {tag} 失敗: {e}")
+
+
 def find_amount_k(obj):
-    """遞迴找 '融資金額' 那一列, 取『今日餘額』(通常是該列最後一個數字)"""
+    """遞迴找含 '融資金額' 的那一列, 取該字串之後的最後一個數字(通常是今日餘額)"""
     if isinstance(obj, list):
-        if obj and isinstance(obj[0], str) and obj[0].startswith("融資金額"):
-            nums = [num(x) for x in obj[1:] if str(x).replace(",", "").strip().replace(".", "").isdigit()]
+        idx = [i for i, x in enumerate(obj) if isinstance(x, str) and "融資金額" in x]
+        if idx:
+            nums = [num(x) for x in obj[idx[0] + 1:] if _isnum(x)]
             if nums:
                 return nums[-1]
         for x in obj:
@@ -155,7 +173,11 @@ def tpex_margin(d):
         for r in rows:
             if len(r) > idx:
                 shares[str(r[0]).strip()] = num(r[idx])
-    return shares, find_amount_k(j)
+    amount = find_amount_k(j)
+    print(f"[tpex] 融資餘額 檔數={len(shares)} 融資金額(仟元)={amount}")
+    if not shares or amount is None:
+        describe("tpex_margin", j)
+    return shares, amount
 
 
 def tpex_close(d):
@@ -171,6 +193,9 @@ def tpex_close(d):
             p = num(r[ip]) if len(r) > ip else 0
             if p > 0:
                 px[str(r[0]).strip()] = p
+    print(f"[tpex] 收盤價 檔數={len(px)}")
+    if not px:
+        describe("tpex_close", j)
     return px
 
 
