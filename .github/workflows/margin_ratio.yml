@@ -1,0 +1,27 @@
+name: margin-ratio
+
+on:
+  schedule:
+    - cron: "30 14 * * 1-5"   # UTC 14:30 = 台灣 22:30, 融資券資料公布後
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - run: python margin_ratio.py
+      - name: commit csv
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/margin_ratio.csv
+          git diff --cached --quiet || git commit -m "update margin ratio"
+          git push
