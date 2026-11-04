@@ -4,9 +4,10 @@
 
 舊算法 (7/30 改版前, 媒體/財經平台常見口徑, 含 ETF):
     維持率 = Σ(全部股票 融資餘額張數 x 1000 x 收盤價) ÷ 融資餘額金額
-新算法 (排除 ETF, 代號 00 開頭):
-    分子 = 只算非 ETF 的擔保品市值
-    分母 = 融資餘額金額 - 估算的 ETF 融資金額 (ETF 融資市值 x 融資成數假設)
+新算法 (排除被動式 ETF, 如 0050, 006208, 00878, 00679B):
+    分子 = 只算「非被動式 ETF」的擔保品市值
+    分母 = 融資餘額金額 - 估算的被動式 ETF 融資金額 (ETF 融資市值 x 融資成數假設)
+    主動式 ETF (代號 00 開頭、字母 A 結尾, 如 00981A) 預設不排除, 要排除請加 --also-active-etf
 
 融資餘額金額(仟元)取自交易所/櫃買的信用交易統計。
 注意: 這是市場整體估算值, 不是證交所公布的「整戶擔保維持率」(兩者口徑不同)。
@@ -15,6 +16,7 @@
     python margin_ratio.py                       # 最近一個有資料的交易日
     python margin_ratio.py --date 2026-07-29     # 指定日期(可拿來對照舊數字)
     python margin_ratio.py --etf-ratio 0.5       # 調整 ETF 融資成數假設(預設 0.6)
+    python margin_ratio.py --also-active-etf     # 連主動式 ETF(00xxxA)也一起排除
     python margin_ratio.py --tpex-amount-k 123   # 櫃買融資金額抓不到時手動給(仟元)
     python margin_ratio.py --debug
 """
@@ -200,9 +202,17 @@ def tpex_close(d):
 
 
 # ---------------- 計算 ----------------
+ALSO_ACTIVE_ETF = False
+
+
 def is_etf(code):
-    """代號 00 開頭 = ETF(0050, 00878, 00981A, 00679B...)"""
-    return code.startswith("00")
+    """被動式 ETF: 代號 00 開頭(0050, 006208, 00878, 00679B, 00631L...).
+    主動式 ETF 代號以 A 結尾(如 00981A), 預設不算在內."""
+    if not code.startswith("00"):
+        return False
+    if code.endswith("A") and not ALSO_ACTIVE_ETF:
+        return False
+    return True
 
 
 def calc(shares, px, amount_k, etf_loan_ratio):
@@ -251,8 +261,8 @@ def run(d, tpex_amount_override=None, etf_ratio=0.6):
         return f"{x / 1e8:,.1f}億"
     for name, X in (("上市", L), ("上櫃", O)):
         if X:
-            print(f"[檢查] {name} 擔保品市值(含ETF)={yi(X['col_all'])} 其中ETF={yi(X['etf_mv'])} "
-                  f"融資金額={yi(X['amt_raw'])} 扣ETF後={yi(X['amt_adj'])} 缺價={X['missing']}檔")
+            print(f"[檢查] {name} 擔保品市值(含ETF)={yi(X['col_all'])} 其中被動ETF={yi(X['etf_mv'])} "
+                  f"融資金額={yi(X['amt_raw'])} 扣被動ETF後={yi(X['amt_adj'])} 缺價={X['missing']}檔")
         else:
             print(f"[檢查] {name} 資料不足, 略過")
 
@@ -294,7 +304,7 @@ def write_readme(rows, path="README.md", keep=30):
         "",
         f"**最新資料日期：{r['date']}**",
         "",
-        "| 市場 | 舊算法（含 ETF，7/30 改版前） | 新算法（排除 ETF） | 差 |",
+        "| 市場 | 舊算法（含 ETF，7/30 改版前） | 新算法（排除被動式 ETF） | 差 |",
         "|---|---|---|---|",
         f"| 上市 | {fmt(r['old_twse'])} | {fmt(r['new_twse'])} | {diff(r['old_twse'], r['new_twse'])} |",
         f"| 上櫃 | {fmt(r['old_tpex'])} | {fmt(r['new_tpex'])} | {diff(r['old_tpex'], r['new_tpex'])} |",
@@ -310,7 +320,7 @@ def write_readme(rows, path="README.md", keep=30):
     lines += [
         "",
         "> **舊算法**：Σ(各股融資餘額張數 x 1000 x 收盤價) ÷ 融資餘額金額，含 ETF。",
-        "> **新算法**：分子排除 ETF（代號 00 開頭）；分母以「ETF 融資市值 x 融資成數假設」估算後扣除。",
+        "> **新算法**：分子排除被動式 ETF（如 0050、006208、00878；主動式 00xxxA 不排除）；分母以「被動式 ETF 融資市值 x 融資成數假設」估算後扣除。",
         "> 皆為市場整體估算值，非證交所公布的整戶擔保維持率。資料來源：證交所、櫃買中心，每個交易日晚上自動更新。",
         "",
     ]
@@ -319,15 +329,17 @@ def write_readme(rows, path="README.md", keep=30):
 
 
 def main():
-    global DEBUG
+    global DEBUG, ALSO_ACTIVE_ETF
     ap = argparse.ArgumentParser()
     ap.add_argument("--date")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--tpex-amount-k", type=float)
+    ap.add_argument("--also-active-etf", action="store_true", help="連主動式 ETF(00xxxA)也排除")
     ap.add_argument("--etf-ratio", type=float, default=0.6, help="ETF 融資成數假設, 預設 0.6")
     ap.add_argument("--csv", default="data/margin_ratio_v2.csv")
     a = ap.parse_args()
     DEBUG = a.debug
+    ALSO_ACTIVE_ETF = a.also_active_etf
 
     if a.date:
         days = [dt.date.fromisoformat(a.date)]
@@ -347,7 +359,7 @@ def main():
         return
 
     print(f"\n日期: {res['date']}")
-    print(f"{'':8}{'舊算法(含ETF)':>14}{'新算法(排除ETF)':>16}")
+    print(f"{'':8}{'舊算法(含ETF)':>14}{'新算法(排除被動ETF)':>18}")
     print(f"{'上市':<8}{fmt(res['old_twse']):>14}{fmt(res['new_twse']):>16}")
     print(f"{'上櫃':<8}{fmt(res['old_tpex']):>14}{fmt(res['new_tpex']):>16}")
     print(f"{'全市場':<7}{fmt(res['old_all']):>14}{fmt(res['new_all']):>16}")
