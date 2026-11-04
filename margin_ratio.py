@@ -29,11 +29,37 @@ TPEX_QUOTE = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/
 DEBUG = False
 
 
-def get(url, params):
-    r = requests.get(url, params=params, headers=UA, timeout=30)
-    r.raise_for_status()
-    time.sleep(3)  # 對交易所客氣一點, 避免被擋
-    return r.json()
+def get(url, params, retries=5):
+    """連線被中斷/逾時就重試(指數退避), 全部失敗才丟出例外"""
+    headers = {
+        **UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9",
+        "Referer": url.split("/web/")[0].split("/rwd/")[0] + "/",
+        "Connection": "close",
+    }
+    last = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+            r.raise_for_status()
+            time.sleep(3)  # 對交易所客氣一點, 避免被擋
+            return r.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            last = e
+            wait = 5 * (2 ** i)
+            print(f"[retry {i + 1}/{retries}] {url.split('/')[-1]}: {type(e).__name__} -> {wait}s 後重試")
+            time.sleep(wait)
+    raise last
+
+
+def safe(fn, *args, default=None):
+    """上櫃資料抓不到時不要讓整支程式掛掉, 改成只算上市"""
+    try:
+        return fn(*args)
+    except Exception as e:
+        print(f"[warn] {fn.__name__} 失敗: {type(e).__name__}: {e}")
+        return default
 
 
 def num(s):
@@ -175,13 +201,16 @@ def run(d, tpex_amount_override=None):
     if sh_l is None:
         return None  # 非交易日或資料未出
     px_l = twse_close(d)
-    sh_o, amt_o = tpex_margin(d)
-    px_o = tpex_close(d)
+    sh_o, amt_o = safe(tpex_margin, d, default=({}, None))
+    px_o = safe(tpex_close, d, default={})
     if tpex_amount_override:
         amt_o = tpex_amount_override
 
     r_l, col_l, miss_l, adj_l = ratio(sh_l, px_l, amt_l)
-    r_o, col_o, miss_o, adj_o = ratio(sh_o, px_o, amt_o)
+    if px_o and sh_o:
+        r_o, col_o, miss_o, adj_o = ratio(sh_o, px_o, amt_o)
+    else:  # 上櫃資料沒抓到, 不要算出誤導性的 0%
+        r_o, col_o, miss_o, adj_o, amt_o = None, 0.0, 0, 0.0, None
     r_all = None
     if amt_l and amt_o and adj_l > 0 and adj_o > 0:
         r_all = (col_l + col_o) / (adj_l + adj_o) * 100
