@@ -179,6 +179,47 @@ def fmt(x):
     return "N/A" if x is None else f"{x:.2f}%"
 
 
+def _p(v):
+    try:
+        return f"{float(v):.2f}%"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def write_readme(rows, path="README.md", keep=30):
+    """把最新結果寫進 README.md, repo 的 Code 首頁就會直接顯示"""
+    rows = sorted(rows, key=lambda r: r["date"], reverse=True)
+    last = rows[0]
+    lines = [
+        "# 台股全市場融資維持率",
+        "",
+        f"**最新資料日期：{last['date']}**",
+        "",
+        "| 市場 | 融資維持率 |",
+        "|---|---|",
+        f"| 上市 | {_p(last['twse_ratio'])} |",
+        f"| 上櫃 | {_p(last['tpex_ratio'])} |",
+        f"| **全市場** | **{_p(last['all_ratio'])}** |",
+        "",
+        f"## 近 {keep} 個交易日",
+        "",
+        "| 日期 | 上市 | 上櫃 | 全市場 |",
+        "|---|---|---|---|",
+    ]
+    for r in rows[:keep]:
+        lines.append(
+            f"| {r['date']} | {_p(r['twse_ratio'])} | {_p(r['tpex_ratio'])} | {_p(r['all_ratio'])} |"
+        )
+    lines += [
+        "",
+        "> 算法：Σ(各股融資餘額張數 x 1000 x 收盤價) ÷ 融資餘額金額，為市場整體估算值，非官方整戶維持率。",
+        "> 資料來源：證交所、櫃買中心。每個交易日晚上自動更新。",
+        "",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 def main():
     global DEBUG
     ap = argparse.ArgumentParser()
@@ -224,6 +265,7 @@ def main():
             w = csv.DictWriter(f, fieldnames=list(res.keys()))
             w.writeheader()
             w.writerows(rows)
+    write_readme(rows)
 
 
 if __name__ == "__main__":
