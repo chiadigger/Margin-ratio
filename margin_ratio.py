@@ -138,18 +138,36 @@ def tpex_close(d):
 
 
 # ---------------- 計算 ----------------
+EXCLUDE_ETF = True
+ETF_LOAN_RATIO = 0.6  # 估算 ETF 融資金額 = ETF 融資餘額市值 x 此比例(融資成數假設)
+
+
+def is_etf(code):
+    """代號 00 開頭 = ETF(0050, 00878, 00981A, 00679B...)"""
+    return code.startswith("00")
+
+
 def ratio(shares, px, amount_k):
+    """回傳 (維持率%, 擔保品市值, 缺價檔數, 扣除ETF後融資金額(元))"""
     if not shares or not amount_k:
-        return None, 0.0, 0
-    collateral, missing = 0.0, 0
+        return None, 0.0, 0, 0.0
+    collateral, missing, etf_mv = 0.0, 0, 0.0
     for code, z in shares.items():
         if z <= 0:
             continue
-        if code in px:
-            collateral += z * 1000 * px[code]
-        else:
+        if code not in px:
             missing += 1
-    return collateral / (amount_k * 1000) * 100, collateral, missing
+            continue
+        mv = z * 1000 * px[code]
+        if EXCLUDE_ETF and is_etf(code):
+            etf_mv += mv
+            continue
+        collateral += mv
+    # 融資金額只有市場總額, 沒有逐檔金額, 所以 ETF 部分用市值 x 成數估算後扣除
+    amount = amount_k * 1000 - etf_mv * ETF_LOAN_RATIO
+    if amount <= 0:
+        return None, collateral, missing, amount
+    return collateral / amount * 100, collateral, missing, amount
 
 
 def run(d, tpex_amount_override=None):
@@ -162,11 +180,11 @@ def run(d, tpex_amount_override=None):
     if tpex_amount_override:
         amt_o = tpex_amount_override
 
-    r_l, col_l, miss_l = ratio(sh_l, px_l, amt_l)
-    r_o, col_o, miss_o = ratio(sh_o, px_o, amt_o)
+    r_l, col_l, miss_l, adj_l = ratio(sh_l, px_l, amt_l)
+    r_o, col_o, miss_o, adj_o = ratio(sh_o, px_o, amt_o)
     r_all = None
-    if amt_l and amt_o:
-        r_all = (col_l + col_o) / ((amt_l + amt_o) * 1000) * 100
+    if amt_l and amt_o and adj_l > 0 and adj_o > 0:
+        r_all = (col_l + col_o) / (adj_l + adj_o) * 100
     return {
         "date": d.isoformat(),
         "twse_ratio": r_l, "tpex_ratio": r_o, "all_ratio": r_all,
@@ -213,6 +231,7 @@ def write_readme(rows, path="README.md", keep=30):
     lines += [
         "",
         "> 算法：Σ(各股融資餘額張數 x 1000 x 收盤價) ÷ 融資餘額金額，為市場整體估算值，非官方整戶維持率。",
+        "> 已排除 ETF（代號 00 開頭）：分子扣除 ETF 擔保品，分母以「ETF 融資市值 x 6 成」估算後扣除。",
         "> 資料來源：證交所、櫃買中心。每個交易日晚上自動更新。",
         "",
     ]
@@ -221,14 +240,18 @@ def write_readme(rows, path="README.md", keep=30):
 
 
 def main():
-    global DEBUG
+    global DEBUG, EXCLUDE_ETF, ETF_LOAN_RATIO
     ap = argparse.ArgumentParser()
+    ap.add_argument("--keep-etf", action="store_true", help="不排除 ETF")
+    ap.add_argument("--etf-ratio", type=float, default=ETF_LOAN_RATIO, help="ETF 融資成數假設, 預設 0.6")
     ap.add_argument("--date")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--tpex-amount-k", type=float)
     ap.add_argument("--csv", default="data/margin_ratio.csv")
     a = ap.parse_args()
     DEBUG = a.debug
+    EXCLUDE_ETF = not a.keep_etf
+    ETF_LOAN_RATIO = a.etf_ratio
 
     if a.date:
         days = [dt.date.fromisoformat(a.date)]
