@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-全市場(上市+上櫃)融資維持率 估算
+全市場(上市+上櫃)融資維持率 - 同時輸出兩種算法
 
-公式(市場整體估算, 非官方整戶維持率):
-    維持率 = Σ(各股融資餘額張數 x 1000 x 收盤價) / 融資餘額金額
-    融資餘額金額 取自交易所/櫃買公布的信用交易統計(仟元)
+舊算法 (7/30 改版前, 媒體/財經平台常見口徑, 含 ETF):
+    維持率 = Σ(全部股票 融資餘額張數 x 1000 x 收盤價) ÷ 融資餘額金額
+新算法 (排除 ETF, 代號 00 開頭):
+    分子 = 只算非 ETF 的擔保品市值
+    分母 = 融資餘額金額 - 估算的 ETF 融資金額 (ETF 融資市值 x 融資成數假設)
+
+融資餘額金額(仟元)取自交易所/櫃買的信用交易統計。
+注意: 這是市場整體估算值, 不是證交所公布的「整戶擔保維持率」(兩者口徑不同)。
 
 用法:
-    python margin_ratio.py                 # 自動找最近一個有資料的交易日
-    python margin_ratio.py --date 2026-11-03
-    python margin_ratio.py --debug         # 印出解析到的欄位, 方便除錯
-    python margin_ratio.py --tpex-amount-k 12345678   # 櫃買融資金額抓不到時手動給(仟元)
+    python margin_ratio.py                       # 最近一個有資料的交易日
+    python margin_ratio.py --date 2026-07-29     # 指定日期(可拿來對照舊數字)
+    python margin_ratio.py --etf-ratio 0.5       # 調整 ETF 融資成數假設(預設 0.6)
+    python margin_ratio.py --tpex-amount-k 123   # 櫃買融資金額抓不到時手動給(仟元)
+    python margin_ratio.py --debug
 """
 import argparse
 import csv
@@ -27,8 +33,13 @@ TPEX_MARGIN = "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/m
 TPEX_QUOTE = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php"
 
 DEBUG = False
+FIELDS = ["date",
+          "old_twse", "old_tpex", "old_all",
+          "new_twse", "new_tpex", "new_all",
+          "twse_amount_k", "tpex_amount_k", "missing_price"]
 
 
+# ---------------- 基礎工具 ----------------
 def get(url, params, retries=5):
     """連線被中斷/逾時就重試(指數退避), 全部失敗才丟出例外"""
     headers = {
@@ -43,7 +54,7 @@ def get(url, params, retries=5):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=30)
             r.raise_for_status()
-            time.sleep(3)  # 對交易所客氣一點, 避免被擋
+            time.sleep(3)  # 對交易所客氣一點
             return r.json()
         except (requests.exceptions.RequestException, ValueError) as e:
             last = e
@@ -164,20 +175,17 @@ def tpex_close(d):
 
 
 # ---------------- 計算 ----------------
-EXCLUDE_ETF = True
-ETF_LOAN_RATIO = 0.6  # 估算 ETF 融資金額 = ETF 融資餘額市值 x 此比例(融資成數假設)
-
-
 def is_etf(code):
     """代號 00 開頭 = ETF(0050, 00878, 00981A, 00679B...)"""
     return code.startswith("00")
 
 
-def ratio(shares, px, amount_k):
-    """回傳 (維持率%, 擔保品市值, 缺價檔數, 扣除ETF後融資金額(元))"""
-    if not shares or not amount_k:
-        return None, 0.0, 0, 0.0
-    collateral, missing, etf_mv = 0.0, 0, 0.0
+def calc(shares, px, amount_k, etf_loan_ratio):
+    """回傳各項加總(元). 一次算出『含ETF』與『排除ETF』兩組分子分母"""
+    if not shares or not px or not amount_k:
+        return None
+    col_all = col_ex = etf_mv = 0.0
+    missing = 0
     for code, z in shares.items():
         if z <= 0:
             continue
@@ -185,18 +193,23 @@ def ratio(shares, px, amount_k):
             missing += 1
             continue
         mv = z * 1000 * px[code]
-        if EXCLUDE_ETF and is_etf(code):
+        col_all += mv
+        if is_etf(code):
             etf_mv += mv
-            continue
-        collateral += mv
-    # 融資金額只有市場總額, 沒有逐檔金額, 所以 ETF 部分用市值 x 成數估算後扣除
-    amount = amount_k * 1000 - etf_mv * ETF_LOAN_RATIO
-    if amount <= 0:
-        return None, collateral, missing, amount
-    return collateral / amount * 100, collateral, missing, amount
+        else:
+            col_ex += mv
+    amt_raw = amount_k * 1000
+    # 融資金額只有市場總額, 沒有逐檔金額, ETF 部分用市值 x 成數估算後扣除
+    amt_adj = amt_raw - etf_mv * etf_loan_ratio
+    return {"col_all": col_all, "col_ex": col_ex, "etf_mv": etf_mv,
+            "amt_raw": amt_raw, "amt_adj": amt_adj, "missing": missing}
 
 
-def run(d, tpex_amount_override=None):
+def pct(a, b):
+    return a / b * 100 if b and b > 0 else None
+
+
+def run(d, tpex_amount_override=None, etf_ratio=0.6):
     sh_l, amt_l = twse_margin(d)
     if sh_l is None:
         return None  # 非交易日或資料未出
@@ -206,29 +219,43 @@ def run(d, tpex_amount_override=None):
     if tpex_amount_override:
         amt_o = tpex_amount_override
 
-    r_l, col_l, miss_l, adj_l = ratio(sh_l, px_l, amt_l)
-    if px_o and sh_o:
-        r_o, col_o, miss_o, adj_o = ratio(sh_o, px_o, amt_o)
-    else:  # 上櫃資料沒抓到, 不要算出誤導性的 0%
-        r_o, col_o, miss_o, adj_o, amt_o = None, 0.0, 0, 0.0, None
-    r_all = None
-    if amt_l and amt_o and adj_l > 0 and adj_o > 0:
-        r_all = (col_l + col_o) / (adj_l + adj_o) * 100
-    return {
-        "date": d.isoformat(),
-        "twse_ratio": r_l, "tpex_ratio": r_o, "all_ratio": r_all,
-        "twse_amount_k": amt_l, "tpex_amount_k": amt_o,
-        "missing_price": miss_l + miss_o,
-    }
+    L = calc(sh_l, px_l, amt_l, etf_ratio)
+    O = calc(sh_o, px_o, amt_o, etf_ratio)
+
+    def yi(x):
+        return f"{x / 1e8:,.1f}億"
+    for name, X in (("上市", L), ("上櫃", O)):
+        if X:
+            print(f"[檢查] {name} 擔保品市值(含ETF)={yi(X['col_all'])} 其中ETF={yi(X['etf_mv'])} "
+                  f"融資金額={yi(X['amt_raw'])} 扣ETF後={yi(X['amt_adj'])} 缺價={X['missing']}檔")
+        else:
+            print(f"[檢查] {name} 資料不足, 略過")
+
+    row = {"date": d.isoformat(),
+           "old_twse": pct(L["col_all"], L["amt_raw"]) if L else None,
+           "old_tpex": pct(O["col_all"], O["amt_raw"]) if O else None,
+           "new_twse": pct(L["col_ex"], L["amt_adj"]) if L else None,
+           "new_tpex": pct(O["col_ex"], O["amt_adj"]) if O else None,
+           "old_all": None, "new_all": None,
+           "twse_amount_k": amt_l, "tpex_amount_k": amt_o if O else None,
+           "missing_price": (L["missing"] if L else 0) + (O["missing"] if O else 0)}
+    if L and O:
+        row["old_all"] = pct(L["col_all"] + O["col_all"], L["amt_raw"] + O["amt_raw"])
+        row["new_all"] = pct(L["col_ex"] + O["col_ex"], L["amt_adj"] + O["amt_adj"])
+    return row
 
 
+# ---------------- 輸出 ----------------
 def fmt(x):
-    return "N/A" if x is None else f"{x:.2f}%"
-
-
-def _p(v):
     try:
-        return f"{float(v):.2f}%"
+        return f"{float(x):.2f}%"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def diff(a, b):
+    try:
+        return f"{float(b) - float(a):+.2f}"
     except (TypeError, ValueError):
         return "N/A"
 
@@ -236,32 +263,30 @@ def _p(v):
 def write_readme(rows, path="README.md", keep=30):
     """把最新結果寫進 README.md, repo 的 Code 首頁就會直接顯示"""
     rows = sorted(rows, key=lambda r: r["date"], reverse=True)
-    last = rows[0]
+    r = rows[0]
     lines = [
         "# 台股全市場融資維持率",
         "",
-        f"**最新資料日期：{last['date']}**",
+        f"**最新資料日期：{r['date']}**",
         "",
-        "| 市場 | 融資維持率 |",
-        "|---|---|",
-        f"| 上市 | {_p(last['twse_ratio'])} |",
-        f"| 上櫃 | {_p(last['tpex_ratio'])} |",
-        f"| **全市場** | **{_p(last['all_ratio'])}** |",
+        "| 市場 | 舊算法（含 ETF，7/30 改版前） | 新算法（排除 ETF） | 差 |",
+        "|---|---|---|---|",
+        f"| 上市 | {fmt(r['old_twse'])} | {fmt(r['new_twse'])} | {diff(r['old_twse'], r['new_twse'])} |",
+        f"| 上櫃 | {fmt(r['old_tpex'])} | {fmt(r['new_tpex'])} | {diff(r['old_tpex'], r['new_tpex'])} |",
+        f"| **全市場** | **{fmt(r['old_all'])}** | **{fmt(r['new_all'])}** | {diff(r['old_all'], r['new_all'])} |",
         "",
-        f"## 近 {keep} 個交易日",
+        f"## 近 {keep} 個交易日（全市場）",
         "",
-        "| 日期 | 上市 | 上櫃 | 全市場 |",
+        "| 日期 | 舊算法 | 新算法 | 差 |",
         "|---|---|---|---|",
     ]
-    for r in rows[:keep]:
-        lines.append(
-            f"| {r['date']} | {_p(r['twse_ratio'])} | {_p(r['tpex_ratio'])} | {_p(r['all_ratio'])} |"
-        )
+    for x in rows[:keep]:
+        lines.append(f"| {x['date']} | {fmt(x['old_all'])} | {fmt(x['new_all'])} | {diff(x['old_all'], x['new_all'])} |")
     lines += [
         "",
-        "> 算法：Σ(各股融資餘額張數 x 1000 x 收盤價) ÷ 融資餘額金額，為市場整體估算值，非官方整戶維持率。",
-        "> 已排除 ETF（代號 00 開頭）：分子扣除 ETF 擔保品，分母以「ETF 融資市值 x 6 成」估算後扣除。",
-        "> 資料來源：證交所、櫃買中心。每個交易日晚上自動更新。",
+        "> **舊算法**：Σ(各股融資餘額張數 x 1000 x 收盤價) ÷ 融資餘額金額，含 ETF。",
+        "> **新算法**：分子排除 ETF（代號 00 開頭）；分母以「ETF 融資市值 x 融資成數假設」估算後扣除。",
+        "> 皆為市場整體估算值，非證交所公布的整戶擔保維持率。資料來源：證交所、櫃買中心，每個交易日晚上自動更新。",
         "",
     ]
     with open(path, "w", encoding="utf-8") as f:
@@ -269,18 +294,15 @@ def write_readme(rows, path="README.md", keep=30):
 
 
 def main():
-    global DEBUG, EXCLUDE_ETF, ETF_LOAN_RATIO
+    global DEBUG
     ap = argparse.ArgumentParser()
-    ap.add_argument("--keep-etf", action="store_true", help="不排除 ETF")
-    ap.add_argument("--etf-ratio", type=float, default=ETF_LOAN_RATIO, help="ETF 融資成數假設, 預設 0.6")
     ap.add_argument("--date")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--tpex-amount-k", type=float)
-    ap.add_argument("--csv", default="data/margin_ratio.csv")
+    ap.add_argument("--etf-ratio", type=float, default=0.6, help="ETF 融資成數假設, 預設 0.6")
+    ap.add_argument("--csv", default="data/margin_ratio_v2.csv")
     a = ap.parse_args()
     DEBUG = a.debug
-    EXCLUDE_ETF = not a.keep_etf
-    ETF_LOAN_RATIO = a.etf_ratio
 
     if a.date:
         days = [dt.date.fromisoformat(a.date)]
@@ -292,31 +314,31 @@ def main():
     for d in days:
         if d.weekday() >= 5:
             continue
-        res = run(d, a.tpex_amount_k)
+        res = run(d, a.tpex_amount_k, a.etf_ratio)
         if res:
             break
     if not res:
         print("找不到資料(非交易日或交易所尚未公布)")
         return
 
-    print(f"日期: {res['date']}")
-    print(f"上市 融資維持率: {fmt(res['twse_ratio'])}")
-    print(f"上櫃 融資維持率: {fmt(res['tpex_ratio'])}")
-    print(f"全市場 融資維持率: {fmt(res['all_ratio'])}")
+    print(f"\n日期: {res['date']}")
+    print(f"{'':8}{'舊算法(含ETF)':>14}{'新算法(排除ETF)':>16}")
+    print(f"{'上市':<8}{fmt(res['old_twse']):>14}{fmt(res['new_twse']):>16}")
+    print(f"{'上櫃':<8}{fmt(res['old_tpex']):>14}{fmt(res['new_tpex']):>16}")
+    print(f"{'全市場':<7}{fmt(res['old_all']):>14}{fmt(res['new_all']):>16}")
     print(f"(缺收盤價檔數: {res['missing_price']})")
 
     os.makedirs(os.path.dirname(a.csv) or ".", exist_ok=True)
-    rows, seen = [], set()
+    rows = []
     if os.path.exists(a.csv):
         with open(a.csv, newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-            seen = {r["date"] for r in rows}
-    if res["date"] not in seen:
-        rows.append({k: ("" if v is None else v) for k, v in res.items()})
-        with open(a.csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(res.keys()))
-            w.writeheader()
-            w.writerows(rows)
+            rows = [r for r in csv.DictReader(f) if r["date"] != res["date"]]
+    rows.append({k: ("" if res[k] is None else res[k]) for k in FIELDS})
+    rows.sort(key=lambda r: r["date"])
+    with open(a.csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w.writeheader()
+        w.writerows(rows)
     write_readme(rows)
 
 
